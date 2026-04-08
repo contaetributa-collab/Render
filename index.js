@@ -19,7 +19,7 @@ const server = http.createServer(async (req, res) => {
   req.on('data', chunk => body += chunk);
   req.on('end', () => {
     try {
-      const { targetUrl, soapAction, soapBody, certBase64, certPassword, signRps } = JSON.parse(body);
+      const { targetUrl, soapAction, soapBody, certBase64, certPassword, signRps, soap12 } = JSON.parse(body);
       
       let finalSoapBody = soapBody;
       
@@ -34,17 +34,24 @@ const server = http.createServer(async (req, res) => {
       
       const parsed = new URL(targetUrl);
 
+      const contentType = soap12
+        ? `application/soap+xml; charset=utf-8; action="${soapAction}"`
+        : 'text/xml; charset=utf-8';
+
       const options = {
         hostname: parsed.hostname,
         port: 443,
         path: parsed.pathname + (parsed.search || ''),
         method: 'POST',
         headers: {
-          'Content-Type': 'text/xml; charset=utf-8',
-          'SOAPAction': soapAction,
+          'Content-Type': contentType,
           'Content-Length': Buffer.byteLength(finalSoapBody, 'utf8'),
         },
       };
+
+      if (!soap12) {
+        options.headers['SOAPAction'] = soapAction;
+      }
 
       if (certBase64) {
         options.pfx = Buffer.from(certBase64, 'base64');
@@ -127,7 +134,6 @@ function signRpsInXml(soapBody, certBase64, certPassword) {
   console.log('[proxy] Signature string (' + sigString.length + ' chars):', sigString);
   
   const pfxBuffer = Buffer.from(certBase64, 'base64');
-  
   const sign = crypto.createSign('SHA1');
   sign.update(sigString, 'ascii');
   
