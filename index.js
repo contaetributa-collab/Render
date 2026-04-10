@@ -21,7 +21,59 @@ const server = http.createServer(async (req, res) => {
   req.on('data', chunk => body += chunk);
   req.on('end', () => {
     try {
-      const { targetUrl, soapAction, soapBody, certBase64, certPassword, signRps, soap12 } = JSON.parse(body);
+      const parsed_body = JSON.parse(body);
+      const { targetUrl, certBase64, certPassword, isRest } = parsed_body;
+
+      // ========== REST MODE (Portal Nacional NFS-e) ==========
+      if (isRest) {
+        const { method: httpMethod, body: restBody, contentType: restContentType } = parsed_body;
+        const requestBody = restBody || '';
+        const parsedUrl = new URL(targetUrl);
+
+        const options = {
+          hostname: parsedUrl.hostname,
+          port: 443,
+          path: parsedUrl.pathname + (parsedUrl.search || ''),
+          method: httpMethod || 'POST',
+          headers: {
+            'Content-Type': restContentType || 'application/json',
+            'Content-Length': Buffer.byteLength(requestBody, 'utf8'),
+            'Accept': 'application/json',
+          },
+        };
+
+        // Add client certificate (mTLS) if provided
+        if (certBase64) {
+          options.pfx = Buffer.from(certBase64, 'base64');
+          options.passphrase = certPassword || '';
+          options.rejectUnauthorized = false;
+        }
+
+        console.log(`[proxy-REST] ${options.method} ${targetUrl}`);
+
+        const proxyReq = https.request(options, (proxyRes) => {
+          let responseBody = '';
+          proxyRes.on('data', chunk => responseBody += chunk);
+          proxyRes.on('end', () => {
+            console.log(`[proxy-REST] Response ${proxyRes.statusCode}, body length: ${responseBody.length}`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: proxyRes.statusCode, body: responseBody }));
+          });
+        });
+
+        proxyReq.on('error', (err) => {
+          console.error('[proxy-REST] Error:', err.message);
+          res.writeHead(502);
+          res.end(JSON.stringify({ error: err.message }));
+        });
+
+        if (requestBody) proxyReq.write(requestBody);
+        proxyReq.end();
+        return;
+      }
+
+      // ========== SOAP MODE (Prefeituras ABRASF) ==========
+      const { soapAction, soapBody, signRps, soap12 } = parsed_body;
 
       let finalSoapBody = soapBody;
 
@@ -36,7 +88,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const parsed = new URL(targetUrl);
+      const parsedUrl = new URL(targetUrl);
 
       // SOAP 1.2 uses application/soap+xml, SOAP 1.1 uses text/xml
       const contentType = soap12
@@ -44,9 +96,9 @@ const server = http.createServer(async (req, res) => {
         : 'text/xml; charset=utf-8';
 
       const options = {
-        hostname: parsed.hostname,
+        hostname: parsedUrl.hostname,
         port: 443,
-        path: parsed.pathname + (parsed.search || ''),
+        path: parsedUrl.pathname + (parsedUrl.search || ''),
         method: 'POST',
         headers: {
           'Content-Type': contentType,
@@ -88,6 +140,39 @@ const server = http.createServer(async (req, res) => {
     }
   });
 });
+
+// Extract private key and certificate from PFX
+function extractPfxMaterials(certBase64, certPassword) {
+  const pfxBuffer = Buffer.from(certBase64, 'base64');
+
+  // Use forge for PFX parsing (Node.js crypto can't easily extract individual certs from PFX)
+  let forge;
+  try {
+    forge = require('node-forge');
+  } catch (e) {
+    // If node-forge not available, use the pfxBuffer directly with crypto
+    return { pfxBuffer, certPassword, useDirectPfx: true };
+  }
+
+  const pfxAsn1 = forge.asn1.fromDer(forge.util.decode64(certBase64));
+  const p12 = forge.pkcs12.pkcs12FromAsn1(pfxAsn1, false, certPassword || '');
+
+  let privateKeyPem = null;
+  let certPem = null;
+
+  for (const safeContents of p12.safeContents) {
+    for (const safeBag of safeContents.safeBags) {
+      if (!privateKeyPem && safeBag.type === forge.pki.oids.pkcs8ShroudedKeyBag && safeBag.key) {
+        privateKeyPem = forge.pki.privateKeyToPem(safeBag.key);
+      }
+      if (!certPem && safeBag.type === forge.pki.oids.certBag && safeBag.cert) {
+        certPem = forge.pki.certificateToPem(safeBag.cert);
+      }
+    }
+  }
+
+  return { privateKeyPem, certPem, pfxBuffer, certPassword, useDirectPfx: !privateKeyPem };
+}
 
 // Sign data using RSA-SHA1 with PFX certificate
 function rsaSha1Sign(data, certBase64, certPassword, encoding = 'ascii') {
@@ -193,8 +278,10 @@ function signRpsAndXmlDsig(soapBody, certBase64, certPassword) {
   );
 
   // === STEP 2: Build XML-DSIG (W3C Signature) ===
+  // Compute SHA-1 digest of the PedidoEnvioLoteRPS (with RPS Assinatura, without XML-DSIG Signature)
   const digestHash = crypto.createHash('sha1').update(pedidoXml, 'utf8').digest('base64');
 
+  // Build canonical SignedInfo with xmlns for signing
   const signedInfoCanonical = '<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">' +
     '<CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"></CanonicalizationMethod>' +
     '<SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"></SignatureMethod>' +
@@ -208,12 +295,16 @@ function signRpsAndXmlDsig(soapBody, certBase64, certPassword) {
     '</Reference>' +
     '</SignedInfo>';
 
+  // RSA-SHA1 sign the canonical SignedInfo
   const signatureValue = rsaSha1Sign(signedInfoCanonical, certBase64, certPassword, 'utf8');
+
+  // Get X509 certificate
   const x509Base64 = getX509CertBase64(certBase64, certPassword);
 
   console.log('[proxy] XML-DSIG DigestValue:', digestHash);
   console.log('[proxy] XML-DSIG SignatureValue length:', signatureValue.length);
 
+  // Build Signature element (SignedInfo WITHOUT xmlns - inherits from parent Signature)
   const signatureElement = '<Signature xmlns="http://www.w3.org/2000/09/xmldsig#">' +
     '<SignedInfo>' +
     '<CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"></CanonicalizationMethod>' +
@@ -231,10 +322,12 @@ function signRpsAndXmlDsig(soapBody, certBase64, certPassword) {
     '<KeyInfo><X509Data><X509Certificate>' + x509Base64 + '</X509Certificate></X509Data></KeyInfo>' +
     '</Signature>';
 
+  // Insert Signature before </PedidoEnvioLoteRPS>
   pedidoXml = pedidoXml.replace('</PedidoEnvioLoteRPS>', signatureElement + '</PedidoEnvioLoteRPS>');
 
   console.log('[proxy] Final pedidoXml length:', pedidoXml.length);
 
+  // Replace CDATA content in the SOAP body
   return soapBody.replace(
     /<!\[CDATA\[[\s\S]*?\]\]>/,
     `<![CDATA[${pedidoXml}]]>`
